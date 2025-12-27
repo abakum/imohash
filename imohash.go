@@ -6,6 +6,7 @@ package imohash
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"io"
 	"os"
@@ -25,6 +26,7 @@ type ImoHash struct {
 	hasher          murmur3.Hash128
 	sampleSize      int
 	sampleThreshold int
+	ctx             context.Context
 }
 
 // New returns a new ImoHash using the default sample size
@@ -41,6 +43,7 @@ func NewCustom(sampleSize, sampleThreshold int) ImoHash {
 		hasher:          murmur3.New128(),
 		sampleSize:      sampleSize,
 		sampleThreshold: sampleThreshold,
+		ctx:             context.Background(),
 	}
 
 	return h
@@ -97,7 +100,10 @@ func (imo *ImoHash) SumSectionReader(f *io.SectionReader) ([Size]byte, error) {
 }
 
 // hashCore hashes a SectionReader using the ImoHash parameters.
+// It respects the context set via SetCtx for cancellation.
+// Caller must ignore the hash value in this case.
 func (imo *ImoHash) hashCore(f *io.SectionReader) ([Size]byte, error) {
+	r := imo.wrapReader(f)
 	var result [Size]byte
 
 	imo.hasher.Reset()
@@ -106,26 +112,45 @@ func (imo *ImoHash) hashCore(f *io.SectionReader) ([Size]byte, error) {
 	if imo.sampleSize < 1 ||
 		msgLen < int64(imo.sampleThreshold) ||
 		msgLen < int64(4*imo.sampleSize) {
-		if _, err := io.Copy(imo.hasher, f); err != nil {
+		n, err := io.Copy(imo.hasher, r)
+		if err != nil {
 			return emptyArray, err
+		}
+		if imo.cancelled(n < msgLen) {
+			return emptyArray, nil
 		}
 	} else {
 		buffer := make([]byte, imo.sampleSize)
-		if _, err := io.ReadFull(f, buffer); err != nil {
+		if n, err := io.ReadFull(r, buffer); err != nil {
+			if imo.cancelled(n == 0) {
+				return emptyArray, nil
+			}
 			return emptyArray, err
 		}
 		imo.hasher.Write(buffer) // these Writes never fail
+		if imo.cancelled(false) {
+			return emptyArray, nil
+		}
 		if _, err := f.Seek(f.Size()/2, 0); err != nil {
 			return emptyArray, err
 		}
-		if _, err := io.ReadFull(f, buffer); err != nil {
+		if n, err := io.ReadFull(r, buffer); err != nil {
+			if imo.cancelled(n == 0) {
+				return emptyArray, nil
+			}
 			return emptyArray, err
 		}
 		imo.hasher.Write(buffer)
+		if imo.cancelled(false) {
+			return emptyArray, nil
+		}
 		if _, err := f.Seek(int64(-imo.sampleSize), 2); err != nil {
 			return emptyArray, err
 		}
-		if _, err := io.ReadFull(f, buffer); err != nil {
+		if n, err := io.ReadFull(r, buffer); err != nil {
+			if imo.cancelled(n == 0) {
+				return emptyArray, nil
+			}
 			return emptyArray, err
 		}
 		imo.hasher.Write(buffer)
@@ -137,4 +162,42 @@ func (imo *ImoHash) hashCore(f *io.SectionReader) ([Size]byte, error) {
 	copy(result[:], hash)
 
 	return result, nil
+}
+
+// SetCtx sets the context for cancellation support
+func (imo *ImoHash) SetCtx(ctx context.Context) {
+	if ctx != nil {
+		imo.ctx = ctx
+	}
+}
+
+// cancelled checks if first or context is cancelled
+func (imo *ImoHash) cancelled(first bool) bool {
+	return first || imo.ctx.Err() != nil
+}
+
+// wrapReader creates a new ContextReader.
+func (imo *ImoHash) wrapReader(r io.Reader) io.Reader {
+	return &ctxReader{r: r, ctx: imo.ctx}
+}
+
+// ctxReader wraps an io.Reader and checks the context for cancellation
+// before and after each Read operation.
+type ctxReader struct {
+	r   io.Reader
+	ctx context.Context
+}
+
+// Read implements the io.Reader interface.
+func (cr *ctxReader) Read(p []byte) (n int, err error) {
+	select {
+	case <-cr.ctx.Done():
+		return 0, io.EOF
+	default:
+		n, err = cr.r.Read(p)
+		if cr.ctx.Err() != nil {
+			return 0, io.EOF
+		}
+		return
+	}
 }
